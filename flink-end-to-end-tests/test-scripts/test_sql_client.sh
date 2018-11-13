@@ -17,8 +17,11 @@
 # limitations under the License.
 ################################################################################
 
+set -Eeuo pipefail
+
 source "$(dirname "$0")"/common.sh
-source "$(dirname "$0")"/kafka-common.sh
+source "$(dirname "$0")"/kafka-common.sh 0.10.2.0 3.2.0 3.2
+source "$(dirname "$0")"/elasticsearch-common.sh
 
 SQL_TOOLBOX_JAR=$END_TO_END_DIR/flink-sql-client-test/target/SqlToolbox.jar
 SQL_JARS_DIR=$END_TO_END_DIR/flink-sql-client-test/target/sql-jars
@@ -33,7 +36,7 @@ mkdir -p $EXTRACTED_JAR
 
 for SQL_JAR in $SQL_JARS_DIR/*.jar; do
   echo "Checking SQL JAR: $SQL_JAR"
-  unzip $SQL_JAR -d $EXTRACTED_JAR > /dev/null
+  (cd $EXTRACTED_JAR && jar xf $SQL_JAR)
 
   # check for proper shading
   for EXTRACTED_FILE in $(find $EXTRACTED_JAR -type f); do
@@ -57,11 +60,13 @@ for SQL_JAR in $SQL_JARS_DIR/*.jar; do
   rm -r $EXTRACTED_JAR/*
 done
 
+rm -r $EXTRACTED_JAR
+
 ################################################################################
-# Run a SQL statement
+# Prepare connectors
 ################################################################################
 
-echo "Testing SQL statement..."
+ELASTICSEARCH_INDEX='my_users'
 
 function sql_cleanup() {
   # don't call ourselves again for another signal interruption
@@ -70,6 +75,7 @@ function sql_cleanup() {
   trap "" EXIT
 
   stop_kafka_cluster
+  shutdown_elasticsearch_cluster "$ELASTICSEARCH_INDEX"
 }
 trap sql_cleanup INT
 trap sql_cleanup EXIT
@@ -100,11 +106,26 @@ send_messages_to_kafka '{"timestamp": "2018-03-12 09:30:00", "user": null, "even
 # pending in results
 send_messages_to_kafka '{"timestamp": "2018-03-12 10:40:00", "user": "Bob", "event": { "type": "ERROR", "message": "This is an error."}}' test-json
 
+# prepare Elasticsearch
+echo "Preparing Elasticsearch..."
+
+ELASTICSEARCH_VERSION=6
+DOWNLOAD_URL='https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-6.3.1.tar.gz'
+
+setup_elasticsearch $DOWNLOAD_URL
+wait_elasticsearch_working
+
+################################################################################
+# Run a SQL statement
+################################################################################
+
+echo "Testing SQL statement..."
+
 # prepare Flink
 echo "Preparing Flink..."
 
 start_cluster
-start_taskmanagers 1
+start_taskmanagers 2
 
 # create session environment file
 RESULT=$TEST_DATA_DIR/result
@@ -113,7 +134,7 @@ SQL_CONF=$TEST_DATA_DIR/sql-client-session.conf
 cat > $SQL_CONF << EOF
 tables:
   - name: JsonSourceTable
-    type: source
+    type: source-table
     update-mode: append
     schema:
       - name: rowtime
@@ -128,7 +149,7 @@ tables:
       - name: user
         type: VARCHAR
       - name: event
-        type: ROW(type VARCHAR, message VARCHAR)
+        type: ROW<type VARCHAR, message VARCHAR>
     connector:
       type: kafka
       version: "0.10"
@@ -165,7 +186,7 @@ tables:
           }
         }
   - name: AvroBothTable
-    type: both
+    type: source-sink-table
     update-mode: append
     schema:
       - name: event_timestamp
@@ -201,7 +222,7 @@ tables:
             ]
         }
   - name: CsvSinkTable
-    type: sink
+    type: sink-table
     update-mode: append
     schema:
       - name: event_timestamp
@@ -212,6 +233,8 @@ tables:
         type: VARCHAR
       - name: duplicate_count
         type: BIGINT
+      - name: constant
+        type: VARCHAR
     connector:
       type: filesystem
       path: $RESULT
@@ -226,6 +249,56 @@ tables:
           type: VARCHAR
         - name: duplicate_count
           type: BIGINT
+        - name: constant
+          type: VARCHAR
+  - name: ElasticsearchUpsertSinkTable
+    type: sink-table
+    update-mode: upsert
+    schema:
+      - name: user_id
+        type: INT
+      - name: user_name
+        type: VARCHAR
+      - name: user_count
+        type: BIGINT
+    connector:
+      type: elasticsearch
+      version: 6
+      hosts:
+        - hostname: "localhost"
+          port: 9200
+          protocol: "http"
+      index: "$ELASTICSEARCH_INDEX"
+      document-type: "user"
+      bulk-flush:
+        max-actions: 1
+    format:
+      type: json
+      derive-schema: true
+  - name: ElasticsearchAppendSinkTable
+    type: sink-table
+    update-mode: append
+    schema:
+      - name: user_id
+        type: INT
+      - name: user_name
+        type: VARCHAR
+      - name: user_count
+        type: BIGINT
+    connector:
+      type: elasticsearch
+      version: 6
+      hosts:
+        - hostname: "localhost"
+          port: 9200
+          protocol: "http"
+      index: "$ELASTICSEARCH_INDEX"
+      document-type: "user"
+      bulk-flush:
+        max-actions: 1
+    format:
+      type: json
+      derive-schema: true
 
 functions:
   - name: RegReplace
@@ -235,7 +308,9 @@ EOF
 
 # submit SQL statements
 
-read -r -d '' SQL_STATEMENT_1 << EOF
+echo "Executing SQL: Kafka JSON -> Kafka Avro"
+
+SQL_STATEMENT_1=$(cat << EOF
 INSERT INTO AvroBothTable
   SELECT
     CAST(TUMBLE_START(rowtime, INTERVAL '1' HOUR) AS VARCHAR) AS event_timestamp,
@@ -249,8 +324,8 @@ INSERT INTO AvroBothTable
     event.message,
     TUMBLE(rowtime, INTERVAL '1' HOUR)
 EOF
+)
 
-echo "Executing SQL: Kafka JSON -> Kafka Avro"
 echo "$SQL_STATEMENT_1"
 
 $FLINK_DIR/bin/sql-client.sh embedded \
@@ -259,13 +334,15 @@ $FLINK_DIR/bin/sql-client.sh embedded \
   --environment $SQL_CONF \
   --update "$SQL_STATEMENT_1"
 
-read -r -d '' SQL_STATEMENT_2 << EOF
+echo "Executing SQL: Kafka Avro -> Filesystem CSV"
+
+SQL_STATEMENT_2=$(cat << EOF
 INSERT INTO CsvSinkTable
-  SELECT *
+  SELECT AvroBothTable.*, RegReplace('Test constant folding.', 'Test', 'Success') AS constant
   FROM AvroBothTable
 EOF
+)
 
-echo "Executing SQL: Kafka Avro -> Filesystem CSV"
 echo "$SQL_STATEMENT_2"
 
 $FLINK_DIR/bin/sql-client.sh embedded \
@@ -285,4 +362,82 @@ for i in {1..10}; do
   sleep 5
 done
 
-check_result_hash "SQLClient" $RESULT "dca08a82cc09f6b19950291dbbef16bb"
+check_result_hash "SQL Client Kafka" $RESULT "0a1bf8bf716069b7269f575f87a802c0"
+
+echo "Executing SQL: Values -> Elasticsearch (upsert)"
+
+SQL_STATEMENT_3=$(cat << EOF
+INSERT INTO ElasticsearchUpsertSinkTable
+  SELECT user_id, user_name, COUNT(*) AS user_count
+  FROM (VALUES (1, 'Bob'), (22, 'Alice'), (42, 'Greg'), (42, 'Greg'), (42, 'Greg'), (1, 'Bob'))
+    AS UserCountTable(user_id, user_name)
+  GROUP BY user_id, user_name
+EOF
+)
+
+JOB_ID=$($FLINK_DIR/bin/sql-client.sh embedded \
+  --library $SQL_JARS_DIR \
+  --jar $SQL_TOOLBOX_JAR \
+  --environment $SQL_CONF \
+  --update "$SQL_STATEMENT_3" | grep "Job ID:" | sed 's/.* //g')
+
+wait_job_terminal_state "$JOB_ID" "FINISHED"
+
+verify_result_hash "SQL Client Elasticsearch Upsert" "$ELASTICSEARCH_INDEX" 3 "982cb32908def9801e781381c1b8a8db"
+
+echo "Executing SQL: Values -> Elasticsearch (append, no key)"
+
+SQL_STATEMENT_4=$(cat << EOF
+INSERT INTO ElasticsearchAppendSinkTable
+  SELECT *
+  FROM (
+    VALUES
+      (1, 'Bob', CAST(0 AS BIGINT)),
+      (22, 'Alice', CAST(0 AS BIGINT)),
+      (42, 'Greg', CAST(0 AS BIGINT)),
+      (42, 'Greg', CAST(0 AS BIGINT)),
+      (42, 'Greg', CAST(0 AS BIGINT)),
+      (1, 'Bob', CAST(0 AS BIGINT)))
+    AS UserCountTable(user_id, user_name, user_count)
+EOF
+)
+
+JOB_ID=$($FLINK_DIR/bin/sql-client.sh embedded \
+  --library $SQL_JARS_DIR \
+  --jar $SQL_TOOLBOX_JAR \
+  --environment $SQL_CONF \
+  --update "$SQL_STATEMENT_4" | grep "Job ID:" | sed 's/.* //g')
+
+wait_job_terminal_state "$JOB_ID" "FINISHED"
+
+# 3 upsert results and 6 append results
+verify_result_line_number 9 "$ELASTICSEARCH_INDEX"
+
+echo "Executing SQL: Match recognize -> Elasticsearch"
+
+SQL_STATEMENT_5=$(cat << EOF
+INSERT INTO ElasticsearchAppendSinkTable
+  SELECT 1 as user_id, T.userName as user_name, cast(1 as BIGINT) as user_count
+  FROM (
+    SELECT user, rowtime
+    FROM JsonSourceTable
+    WHERE user IS NOT NULL)
+  MATCH_RECOGNIZE (
+    ORDER BY rowtime
+    MEASURES
+        user as userName
+    PATTERN (A)
+    DEFINE
+        A as user = 'Alice'
+  ) T
+EOF
+)
+
+JOB_ID=$($FLINK_DIR/bin/sql-client.sh embedded \
+  --library $SQL_JARS_DIR \
+  --jar $SQL_TOOLBOX_JAR \
+  --environment $SQL_CONF \
+  --update "$SQL_STATEMENT_5" | grep "Job ID:" | sed 's/.* //g')
+
+# 3 upsert results and 6 append results and 3 match_recognize results
+verify_result_line_number 12 "$ELASTICSEARCH_INDEX"

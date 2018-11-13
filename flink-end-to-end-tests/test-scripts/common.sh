@@ -17,6 +17,8 @@
 # limitations under the License.
 ################################################################################
 
+# Enable this line when developing a new end-to-end test
+#set -Eexuo pipefail
 set -o pipefail
 
 if [[ -z $FLINK_DIR ]]; then
@@ -33,6 +35,7 @@ case "$(uname -s)" in
 esac
 
 export EXIT_CODE=0
+export TASK_SLOTS_PER_TM_HA=4
 
 echo "Flink dist directory: $FLINK_DIR"
 
@@ -123,7 +126,7 @@ function create_ha_config() {
     jobmanager.rpc.port: 6123
     jobmanager.heap.mb: 1024
     taskmanager.heap.mb: 1024
-    taskmanager.numberOfTaskSlots: 4
+    taskmanager.numberOfTaskSlots: ${TASK_SLOTS_PER_TM_HA}
 
     #==============================================================================
     # High Availability
@@ -238,9 +241,7 @@ function start_local_zk {
     done < <(grep "^server\." "${FLINK_DIR}/conf/zoo.cfg")
 }
 
-function start_cluster {
-  "$FLINK_DIR"/bin/start-cluster.sh
-
+function wait_dispatcher_running {
   # wait at most 10 seconds until the dispatcher is up
   local QUERY_URL
   if [ "x$USE_SSL" = "xON" ]; then
@@ -262,6 +263,11 @@ function start_cluster {
     echo "Waiting for dispatcher REST endpoint to come up..."
     sleep 1
   done
+}
+
+function start_cluster {
+  "$FLINK_DIR"/bin/start-cluster.sh
+  wait_dispatcher_running
 }
 
 function start_taskmanagers {
@@ -300,12 +306,14 @@ function start_and_wait_for_tm {
 }
 
 function check_logs_for_errors {
-  if grep -rv "GroupCoordinatorNotAvailableException" $FLINK_DIR/log \
+  echo "Checking for errors..."
+  error_count=$(grep -rv "GroupCoordinatorNotAvailableException" $FLINK_DIR/log \
       | grep -v "RetriableCommitFailedException" \
       | grep -v "NoAvailableBrokersException" \
       | grep -v "Async Kafka commit failed" \
       | grep -v "DisconnectException" \
       | grep -v "AskTimeoutException" \
+      | grep -v "Error while loading kafka-version.properties" \
       | grep -v "WARN  akka.remote.transport.netty.NettyTransport" \
       | grep -v  "WARN  org.apache.flink.shaded.akka.org.jboss.netty.channel.DefaultChannelPipeline" \
       | grep -v "jvm-exit-on-fatal-error" \
@@ -314,43 +322,57 @@ function check_logs_for_errors {
       | grep -v "An exception was thrown by an exception handler" \
       | grep -v "java.lang.NoClassDefFoundError: org/apache/hadoop/yarn/exceptions/YarnException" \
       | grep -v "java.lang.NoClassDefFoundError: org/apache/hadoop/conf/Configuration" \
-      | grep -iq "error"; then
+      | grep -v "org.apache.flink.fs.shaded.hadoop3.org.apache.commons.beanutils.FluentPropertyBeanIntrospector  - Error when creating PropertyDescriptor for public final void org.apache.flink.fs.shaded.hadoop3.org.apache.commons.configuration2.AbstractConfiguration.setProperty(java.lang.String,java.lang.Object)! Ignoring this property." \
+      | grep -v "Error while loading kafka-version.properties :null" \
+      | grep -ic "error" || true)
+  if [[ ${error_count} -gt 0 ]]; then
     echo "Found error in log files:"
     cat $FLINK_DIR/log/*
     EXIT_CODE=1
+  else
+    echo "No errors in log files."
   fi
 }
 
 function check_logs_for_exceptions {
-  if grep -rv "GroupCoordinatorNotAvailableException" $FLINK_DIR/log \
-      | grep -v "RetriableCommitFailedException" \
-      | grep -v "NoAvailableBrokersException" \
-      | grep -v "Async Kafka commit failed" \
-      | grep -v "DisconnectException" \
-      | grep -v "AskTimeoutException" \
-      | grep -v "WARN  akka.remote.transport.netty.NettyTransport" \
-      | grep -v  "WARN  org.apache.flink.shaded.akka.org.jboss.netty.channel.DefaultChannelPipeline" \
-      | grep -v '^INFO:.*AWSErrorCode=\[400 Bad Request\].*ServiceEndpoint=\[https://.*\.s3\.amazonaws\.com\].*RequestType=\[HeadBucketRequest\]' \
-      | grep -v "RejectedExecutionException" \
-      | grep -v "An exception was thrown by an exception handler" \
-      | grep -v "Caused by: java.lang.ClassNotFoundException: org.apache.hadoop.yarn.exceptions.YarnException" \
-      | grep -v "Caused by: java.lang.ClassNotFoundException: org.apache.hadoop.conf.Configuration" \
-      | grep -v "java.lang.NoClassDefFoundError: org/apache/hadoop/yarn/exceptions/YarnException" \
-      | grep -v "java.lang.NoClassDefFoundError: org/apache/hadoop/conf/Configuration" \
-      | grep -v "java.lang.Exception: Execution was suspended" \
-      | grep -v "Caused by: java.lang.Exception: JobManager is shutting down" \
-      | grep -iq "exception"; then
+  echo "Checking for exceptions..."
+  exception_count=$(grep -rv "GroupCoordinatorNotAvailableException" $FLINK_DIR/log \
+   | grep -v "RetriableCommitFailedException" \
+   | grep -v "NoAvailableBrokersException" \
+   | grep -v "Async Kafka commit failed" \
+   | grep -v "DisconnectException" \
+   | grep -v "AskTimeoutException" \
+   | grep -v "WARN  akka.remote.transport.netty.NettyTransport" \
+   | grep -v  "WARN  org.apache.flink.shaded.akka.org.jboss.netty.channel.DefaultChannelPipeline" \
+   | grep -v '^INFO:.*AWSErrorCode=\[400 Bad Request\].*ServiceEndpoint=\[https://.*\.s3\.amazonaws\.com\].*RequestType=\[HeadBucketRequest\]' \
+   | grep -v "RejectedExecutionException" \
+   | grep -v "An exception was thrown by an exception handler" \
+   | grep -v "Caused by: java.lang.ClassNotFoundException: org.apache.hadoop.yarn.exceptions.YarnException" \
+   | grep -v "Caused by: java.lang.ClassNotFoundException: org.apache.hadoop.conf.Configuration" \
+   | grep -v "java.lang.NoClassDefFoundError: org/apache/hadoop/yarn/exceptions/YarnException" \
+   | grep -v "java.lang.NoClassDefFoundError: org/apache/hadoop/conf/Configuration" \
+   | grep -v "java.lang.Exception: Execution was suspended" \
+   | grep -v "java.io.InvalidClassException: org.apache.flink.formats.avro.typeutils.AvroSerializer" \
+   | grep -v "Caused by: java.lang.Exception: JobManager is shutting down" \
+   | grep -v "java.lang.Exception: Artificial failure" \
+   | grep -ic "exception" || true)
+  if [[ ${exception_count} -gt 0 ]]; then
     echo "Found exception in log files:"
     cat $FLINK_DIR/log/*
     EXIT_CODE=1
+  else
+    echo "No exceptions in log files."
   fi
 }
 
 function check_logs_for_non_empty_out_files {
+  echo "Checking for non-empty .out files..."
   if grep -ri "." $FLINK_DIR/log/*.out > /dev/null; then
     echo "Found non-empty .out files:"
     cat $FLINK_DIR/log/*.out
     EXIT_CODE=1
+  else
+    echo "No non-empty .out files."
   fi
 }
 
@@ -364,7 +386,9 @@ function stop_cluster {
   "$FLINK_DIR"/bin/stop-cluster.sh
 
   # stop zookeeper only if there are processes running
-  if ! [ "`jps | grep 'FlinkZooKeeperQuorumPeer' | wc -l`" = "0" ]; then
+  zookeeper_process_count=$(jps | grep -c 'FlinkZooKeeperQuorumPeer' || true)
+  if [[ ${zookeeper_process_count} -gt 0 ]]; then
+    echo "Stopping zookeeper..."
     "$FLINK_DIR"/bin/zookeeper.sh stop
   fi
 }
@@ -408,7 +432,7 @@ function wait_job_terminal_state {
   echo "Waiting for job ($job) to reach terminal state $terminal_state ..."
 
   while : ; do
-    N=$(grep -o "Job $job reached globally terminal state $terminal_state" $FLINK_DIR/log/*standalonesession*.log | tail -1)
+    N=$(grep -o "Job $job reached globally terminal state $terminal_state" $FLINK_DIR/log/*standalonesession*.log | tail -1 || true)
 
     if [[ -z $N ]]; then
       sleep 1
@@ -427,6 +451,16 @@ function cancel_job {
 }
 
 function check_result_hash {
+  local error_code=0
+  check_result_hash_no_exit "$@" || error_code=$?
+
+  if [ "$error_code" != "0" ]
+  then
+    exit $error_code
+  fi
+}
+
+function check_result_hash_no_exit {
   local name=$1
   local outfile_prefix=$2
   local expected=$3
@@ -438,55 +472,19 @@ function check_result_hash {
     actual=$(LC_ALL=C sort $outfile_prefix* | md5sum | awk '{print $1}')
   else
     echo "Neither 'md5' nor 'md5sum' binary available."
-    exit 2
+    return 2
   fi
   if [[ "$actual" != "$expected" ]]
   then
     echo "FAIL $name: Output hash mismatch.  Got $actual, expected $expected."
     echo "head hexdump of actual:"
     head $outfile_prefix* | hexdump -c
-    exit 1
+    return 1
   else
     echo "pass $name"
     # Output files are left behind in /tmp
   fi
-}
-
-function s3_put {
-  local_file=$1
-  bucket=$2
-  s3_file=$3
-  resource="/${bucket}/${s3_file}"
-  contentType="application/octet-stream"
-  dateValue=`date -R`
-  stringToSign="PUT\n\n${contentType}\n${dateValue}\n${resource}"
-  s3Key=$ARTIFACTS_AWS_ACCESS_KEY
-  s3Secret=$ARTIFACTS_AWS_SECRET_KEY
-  signature=`echo -en ${stringToSign} | openssl sha1 -hmac ${s3Secret} -binary | base64`
-  curl -X PUT -T "${local_file}" \
-    -H "Host: ${bucket}.s3.amazonaws.com" \
-    -H "Date: ${dateValue}" \
-    -H "Content-Type: ${contentType}" \
-    -H "Authorization: AWS ${s3Key}:${signature}" \
-    https://${bucket}.s3.amazonaws.com/${s3_file}
-}
-
-function s3_delete {
-  bucket=$1
-  s3_file=$2
-  resource="/${bucket}/${s3_file}"
-  contentType="application/octet-stream"
-  dateValue=`date -R`
-  stringToSign="DELETE\n\n${contentType}\n${dateValue}\n${resource}"
-  s3Key=$ARTIFACTS_AWS_ACCESS_KEY
-  s3Secret=$ARTIFACTS_AWS_SECRET_KEY
-  signature=`echo -en ${stringToSign} | openssl sha1 -hmac ${s3Secret} -binary | base64`
-  curl -X DELETE \
-    -H "Host: ${bucket}.s3.amazonaws.com" \
-    -H "Date: ${dateValue}" \
-    -H "Content-Type: ${contentType}" \
-    -H "Authorization: AWS ${s3Key}:${signature}" \
-    https://${bucket}.s3.amazonaws.com/${s3_file}
+  return 0
 }
 
 # This function starts the given number of task managers and monitors their processes.
@@ -516,9 +514,9 @@ function tm_kill_all {
 
 # Kills all processes that match the given name.
 function kill_all {
-  local pid=`jps | grep -E "${1}" | cut -d " " -f 1`
-  kill ${pid} 2> /dev/null
-  wait ${pid} 2> /dev/null
+  local pid=`jps | grep -E "${1}" | cut -d " " -f 1 || true`
+  kill ${pid} 2> /dev/null || true
+  wait ${pid} 2> /dev/null || true
 }
 
 function kill_random_taskmanager {
@@ -594,6 +592,33 @@ function wait_oper_metric_num_in_records {
     done
 }
 
+function wait_num_of_occurence_in_logs {
+    local text=$1
+    local number=$2
+    local logs
+    if [ -z "$3" ]; then
+        logs="standalonesession"
+    else
+        logs="$3"
+    fi
+
+    echo "Waiting for text ${text} to appear ${number} of times in logs..."
+
+    while : ; do
+      N=$(grep -o "${text}" $FLINK_DIR/log/*${logs}*.log | wc -l)
+
+      if [ -z $N ]; then
+        N=0
+      fi
+
+      if (( N < number )); then
+        sleep 1
+      else
+        break
+      fi
+    done
+}
+
 function wait_num_checkpoints {
     JOB=$1
     NUM_CHECKPOINTS=$2
@@ -631,11 +656,6 @@ function clean_stdout_files {
     echo "Deleted all stdout files under ${FLINK_DIR}/log/"
 }
 
-function clean_log_files {
-    rm ${FLINK_DIR}/log/*
-    echo "Deleted all files under ${FLINK_DIR}/log/"
-}
-
 # Expect a string to appear in the log files of the task manager before a given timeout
 # $1: expected string
 # $2: timeout in seconds
@@ -652,6 +672,23 @@ function expect_in_taskmanager_logs {
         if ((i > timeout)); then
             echo "A timeout occurred waiting for '${expected}' to appear in the taskmanager logs"
             exit 1
+        fi
+    done
+}
+
+function wait_for_restart_to_complete {
+    local base_num_restarts=$1
+    local jobid=$2
+
+    local current_num_restarts=${base_num_restarts}
+    local expected_num_restarts=$((current_num_restarts + 1))
+
+    echo "Waiting for restart to happen"
+    while ! [[ ${current_num_restarts} -eq ${expected_num_restarts} ]]; do
+        sleep 5
+        current_num_restarts=$(get_job_metric ${jobid} "fullRestarts")
+        if [[ -z ${current_num_restarts} ]]; then
+            current_num_restarts=${base_num_restarts}
         fi
     done
 }

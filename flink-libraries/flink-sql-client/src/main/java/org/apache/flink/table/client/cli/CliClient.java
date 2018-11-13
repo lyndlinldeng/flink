@@ -21,6 +21,7 @@ package org.apache.flink.table.client.cli;
 import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.client.SqlClientException;
 import org.apache.flink.table.client.cli.SqlCommandParser.SqlCommandCall;
+import org.apache.flink.table.client.config.entries.ViewEntry;
 import org.apache.flink.table.client.gateway.Executor;
 import org.apache.flink.table.client.gateway.ProgramTargetDescriptor;
 import org.apache.flink.table.client.gateway.ResultDescriptor;
@@ -32,7 +33,6 @@ import org.jline.reader.LineReader;
 import org.jline.reader.LineReaderBuilder;
 import org.jline.reader.MaskingCallback;
 import org.jline.reader.UserInterruptException;
-import org.jline.reader.impl.DefaultParser;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 import org.jline.utils.AttributedString;
@@ -94,13 +94,19 @@ public class CliClient {
 		}
 
 		// initialize line lineReader
-		final DefaultParser parser = new DefaultParser();
-		parser.setEofOnEscapedNewLine(true); // allows for multi-line commands
 		lineReader = LineReaderBuilder.builder()
 			.terminal(terminal)
 			.appName(CliStrings.CLI_NAME)
-			.parser(parser)
+			.parser(new SqlMultiLineParser())
+			.completer(new SqlCompleter(context, executor))
 			.build();
+		// this option is disabled for now for correct backslash escaping
+		// a "SELECT '\'" query should return a string with a backslash
+		lineReader.option(LineReader.Option.DISABLE_EVENT_EXPANSION, true);
+		// set strict "typo" distance between words when doing code completion
+		lineReader.setVariable(LineReader.ERRORS, 1);
+		// perform code completion case insensitive
+		lineReader.option(LineReader.Option.CASE_INSENSITIVE, true);
 
 		// create prompt
 		prompt = new AttributedStringBuilder()
@@ -168,16 +174,19 @@ public class CliClient {
 			terminal.writer().append("\n");
 			terminal.flush();
 
-			String line;
+			final String line;
 			try {
 				line = lineReader.readLine(prompt, null, (MaskingCallback) null, null);
-			} catch (UserInterruptException | EndOfFileException | IOError e) {
-				// user cancelled application with Ctrl+C or kill
+			} catch (UserInterruptException e) {
+				// user cancelled line with Ctrl+C
+				continue;
+			} catch (EndOfFileException | IOError e) {
+				// user cancelled application with Ctrl+D or kill
 				break;
 			} catch (Throwable t) {
 				throw new SqlClientException("Could not read from command line.", t);
 			}
-			if (line == null || line.equals("")) {
+			if (line == null) {
 				continue;
 			}
 			final Optional<SqlCommandCall> cmdCall = parseCommand(line);
@@ -417,15 +426,15 @@ public class CliClient {
 		final String name = cmdCall.operands[0];
 		final String query = cmdCall.operands[1];
 
-		final String previousQuery = context.getViews().get(name);
-		if (previousQuery != null) {
+		final ViewEntry previousView = context.getViews().get(name);
+		if (previousView != null) {
 			printExecutionError(CliStrings.MESSAGE_VIEW_ALREADY_EXISTS);
 			return;
 		}
 
 		try {
 			// perform and validate change
-			context.addView(name, query);
+			context.addView(ViewEntry.create(name, query));
 			executor.validateSession(context);
 			printInfo(CliStrings.MESSAGE_VIEW_CREATED);
 		} catch (SqlExecutionException e) {
@@ -437,9 +446,9 @@ public class CliClient {
 
 	private void callDropView(SqlCommandCall cmdCall) {
 		final String name = cmdCall.operands[0];
-		final String query = context.getViews().get(name);
+		final ViewEntry view = context.getViews().get(name);
 
-		if (query == null) {
+		if (view == null) {
 			printExecutionError(CliStrings.MESSAGE_VIEW_NOT_FOUND);
 			return;
 		}
@@ -451,7 +460,7 @@ public class CliClient {
 			printInfo(CliStrings.MESSAGE_VIEW_REMOVED);
 		} catch (SqlExecutionException e) {
 			// rollback change
-			context.addView(name, query);
+			context.addView(view);
 			printExecutionException(CliStrings.MESSAGE_VIEW_NOT_REMOVED, e);
 		}
 	}

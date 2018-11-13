@@ -29,6 +29,7 @@ import org.apache.flink.streaming.api.functions.sink.PrintSinkFunction;
 import org.apache.flink.streaming.api.functions.windowing.WindowFunction;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.streaming.tests.artificialstate.ComplexPayload;
+import org.apache.flink.streaming.tests.artificialstate.StatefulComplexPayloadSerializer;
 import org.apache.flink.streaming.tests.avro.ComplexPayloadAvro;
 import org.apache.flink.streaming.tests.avro.InnerPayLoadAvro;
 import org.apache.flink.util.Collector;
@@ -40,7 +41,7 @@ import static org.apache.flink.streaming.tests.DataStreamAllroundTestJobFactory.
 import static org.apache.flink.streaming.tests.DataStreamAllroundTestJobFactory.createArtificialKeyedStateMapper;
 import static org.apache.flink.streaming.tests.DataStreamAllroundTestJobFactory.createArtificialOperatorStateMapper;
 import static org.apache.flink.streaming.tests.DataStreamAllroundTestJobFactory.createEventSource;
-import static org.apache.flink.streaming.tests.DataStreamAllroundTestJobFactory.createExceptionThrowingFailureMapper;
+import static org.apache.flink.streaming.tests.DataStreamAllroundTestJobFactory.createFailureMapper;
 import static org.apache.flink.streaming.tests.DataStreamAllroundTestJobFactory.createSemanticsCheckMapper;
 import static org.apache.flink.streaming.tests.DataStreamAllroundTestJobFactory.createTimestampExtractor;
 import static org.apache.flink.streaming.tests.DataStreamAllroundTestJobFactory.isSimulateFailures;
@@ -67,7 +68,7 @@ public class DataStreamAllroundTestProgram {
 	private static final String OPERATOR_STATE_OPER_NAME = "ArtificalOperatorStateMapper";
 	private static final String TIME_WINDOW_OPER_NAME = "TumblingWindowOperator";
 	private static final String SEMANTICS_CHECK_MAPPER_NAME = "SemanticsCheckMapper";
-	private static final String FAILURE_MAPPER_NAME = "ExceptionThrowingFailureMapper";
+	private static final String FAILURE_MAPPER_NAME = "FailureMapper";
 
 	public static void main(String[] args) throws Exception {
 		final ParameterTool pt = ParameterTool.fromArgs(args);
@@ -91,11 +92,12 @@ public class DataStreamAllroundTestProgram {
 							}
 							return new ComplexPayload(event, KEYED_STATE_OPER_NAME);
 						},
-					Collections.singletonList(
-						new KryoSerializer<>(ComplexPayload.class, env.getConfig())), // custom KryoSerializer
+					Arrays.asList(
+						new KryoSerializer<>(ComplexPayload.class, env.getConfig()), // KryoSerializer
+						new StatefulComplexPayloadSerializer()), // custom stateful serializer
 					Collections.singletonList(ComplexPayload.class) // KryoSerializer via type extraction
 				)
-			).returns(Event.class).name(KEYED_STATE_OPER_NAME + "_Kryo");
+			).returns(Event.class).name(KEYED_STATE_OPER_NAME + "_Kryo_and_Custom_Stateful");
 
 		// add a keyed stateful map operator, which uses Avro for state serialization
 		eventStream = eventStream
@@ -143,7 +145,7 @@ public class DataStreamAllroundTestProgram {
 
 		if (isSimulateFailures(pt)) {
 			eventStream3 = eventStream3
-				.map(createExceptionThrowingFailureMapper(pt))
+				.map(createFailureMapper(pt))
 				.setParallelism(1)
 				.name(FAILURE_MAPPER_NAME);
 		}
