@@ -67,7 +67,7 @@ public class LocalBufferPoolTest extends TestLogger {
 
 	@Before
 	public void setupLocalBufferPool() {
-		networkBufferPool = new NetworkBufferPool(numBuffers, memorySegmentSize);
+		networkBufferPool = new NetworkBufferPool(numBuffers, memorySegmentSize, 1);
 		localBufferPool = new LocalBufferPool(networkBufferPool, 1);
 
 		assertEquals(0, localBufferPool.getNumberOfAvailableMemorySegments());
@@ -414,10 +414,14 @@ public class LocalBufferPoolTest extends TestLogger {
 			AtomicInteger times = new AtomicInteger(0);
 
 			@Override
-			public boolean notifyBufferAvailable(Buffer buffer) {
+			public NotificationResult notifyBufferAvailable(Buffer buffer) {
 				int newCount = times.incrementAndGet();
 				buffer.recycleBuffer();
-				return newCount < notificationTimes;
+				if (newCount < notificationTimes) {
+					return NotificationResult.BUFFER_USED_NEED_MORE;
+				} else {
+					return NotificationResult.BUFFER_USED_NO_NEED_MORE;
+				}
 			}
 
 			@Override
